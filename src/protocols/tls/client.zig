@@ -227,31 +227,46 @@ const NativeConnection = struct {
         }
     }
 
-    /// Captures one post-handshake NewSessionTicket record's plaintext
-    /// (full handshake message: type 4 + body, single record). Replaces
-    /// any previously captured session. Unparseable or unusable tickets
+    /// Captures a post-handshake handshake record's plaintext. A single
+    /// record may coalesce several NewSessionTicket messages (type 4), each
+    /// framed by its own 4-byte handshake header (type + u24 length), so
+    /// iterate message by message rather than assuming one ticket fills the
+    /// record. The last valid ticket wins. Unparseable or unusable tickets
     /// fail loudly: a corrupt ticket stream must never silently downgrade
     /// resumption bookkeeping.
     fn captureTicketRecord(self: *NativeConnection, plaintext: []const u8) Error!void {
         const master = self.resumptionMaster orelse return error.TlsRecordError;
         const host = self.sessionHost orelse return error.TlsRecordError;
-        if (plaintext.len < 4) return error.TlsRecordError;
-        if (plaintext[0] != @intFromEnum(handshakeMod.HandshakeType.new_session_ticket)) {
-            return error.TlsRecordError;
-        }
-        const nst = handshakeMod.NewSessionTicket.decode(plaintext[4..]) catch return error.TlsRecordError;
         const nowMs: u64 = @intCast(clockMod.millisNow());
-        var fresh = sessionMod.clientSessionFromTicket(
-            self.allocator,
-            nst,
-            master,
-            self.suite,
-            host,
-            nowMs,
-        ) catch return error.TlsRecordError;
-        errdefer fresh.deinit(self.allocator);
-        if (self.pendingSession) |*old| old.deinit(self.allocator);
-        self.pendingSession = fresh;
+
+        var off: usize = 0;
+        while (off < plaintext.len) {
+            if (plaintext.len - off < 4) return error.TlsRecordError;
+            if (plaintext[off] != @intFromEnum(handshakeMod.HandshakeType.new_session_ticket)) {
+                return error.TlsRecordError;
+            }
+            const msgLen: usize = (@as(usize, plaintext[off + 1]) << 16) |
+                (@as(usize, plaintext[off + 2]) << 8) |
+                @as(usize, plaintext[off + 3]);
+            const bodyStart = off + 4;
+            if (bodyStart + msgLen > plaintext.len) return error.TlsRecordError;
+            const body = plaintext[bodyStart .. bodyStart + msgLen];
+
+            const nst = handshakeMod.NewSessionTicket.decode(body) catch return error.TlsRecordError;
+            var fresh = sessionMod.clientSessionFromTicket(
+                self.allocator,
+                nst,
+                master,
+                self.suite,
+                host,
+                nowMs,
+            ) catch return error.TlsRecordError;
+            errdefer fresh.deinit(self.allocator);
+            if (self.pendingSession) |*old| old.deinit(self.allocator);
+            self.pendingSession = fresh;
+
+            off = bodyStart + msgLen;
+        }
     }
 };
 
@@ -1642,4 +1657,76 @@ test "tls.Client serves concurrent connects from one owner" {
     for (&threads) |*th| th.* = try std.Thread.spawn(.{}, Worker.run, .{ &owner, ctx.io, port, &fails });
     for (&threads) |*th| th.join();
     try std.testing.expectEqual(@as(usize, 0), fails.load(.seq_cst));
+}
+
+// Builds a NativeConnection with only the fields `captureTicketRecord` and
+// `deinit`, everything else is left undefined on purpose.
+fn ticketTestConnection(a: Allocator) !NativeConnection {
+    var conn: NativeConnection = undefined;
+    conn.allocator = a;
+    conn.suite = .AES_128_GCM_SHA256;
+    conn.resumptionMaster = [_]u8{0xAB} ** 32;
+    conn.captureSession = true;
+    conn.sessionHost = try a.dupe(u8, "example.com");
+    conn.pendingSession = null;
+    conn.writeBuf = &.{};
+    conn.readBuf = &.{};
+    return conn;
+}
+
+test "captureTicketRecord accepts multiple coalesced NewSessionTickets" {
+    const a = std.testing.allocator;
+
+    // Two tickets with distinct bodies, concatenated into one record.
+    // `encode` emits a full handshake message (type + u24 length + body),
+    // so concatenation reproduces a server that coalesces both tickets.
+    const nst1: handshakeMod.NewSessionTicket = .{
+        .lifetimeSecs = 7200,
+        .ageAdd = 0x11223344,
+        .nonce = &[_]u8{ 0x01, 0x02 },
+        .ticket = "TICKET-AAA",
+    };
+    const nst2: handshakeMod.NewSessionTicket = .{
+        .lifetimeSecs = 7200,
+        .ageAdd = 0x55667788,
+        .nonce = &[_]u8{ 0x03, 0x04 },
+        .ticket = "TICKET-BBB",
+    };
+    const m1 = try nst1.encode(a);
+    defer a.free(m1);
+    const m2 = try nst2.encode(a);
+    defer a.free(m2);
+    const plaintext = try std.mem.concat(a, u8, &.{ m1, m2 });
+    defer a.free(plaintext);
+
+    var conn = try ticketTestConnection(a);
+    defer conn.deinit();
+
+    try conn.captureTicketRecord(plaintext);
+
+    const session = conn.pendingSession orelse return error.NoTicketCaptured;
+    try std.testing.expectEqualSlices(u8, "TICKET-BBB", session.ticket);
+}
+
+test "captureTicketRecord rejects a truncated trailing handshake header" {
+    const a = std.testing.allocator;
+
+    const nst: handshakeMod.NewSessionTicket = .{
+        .lifetimeSecs = 7200,
+        .ageAdd = 0x11223344,
+        .nonce = &[_]u8{ 0x01, 0x02 },
+        .ticket = "TICKET-AAA",
+    };
+    const m1 = try nst.encode(a);
+    defer a.free(m1);
+
+    // One complete ticket followed by a 2 byte stub which is less that the
+    // required 4 bytes a handshake header requires so it should be rejected.
+    const plaintext = try std.mem.concat(a, u8, &.{ m1, &[_]u8{ 0x04, 0x00 } });
+    defer a.free(plaintext);
+
+    var conn = try ticketTestConnection(a);
+    defer conn.deinit();
+
+    try std.testing.expectError(error.TlsRecordError, conn.captureTicketRecord(plaintext));
 }
